@@ -44,6 +44,9 @@ const FACE_HELPER_SOURCE = path.join(__dirname, 'scripts', 'face-vision.swift');
 let config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8'));
 config.spaceRegistry = config.spaceRegistry || { bindings: {} };
 config.spaceRegistry.environmentSources = config.spaceRegistry.environmentSources || {};
+// AI 端点可能是明文 HTTP（本地推理服务）或 HTTPS（云 API），按 baseUrl 协议选择客户端，
+// 避免 https.request 打到 HTTP 端口报 "tls wrong version number"。
+const aiHttpClient = (config.ai && config.ai.baseUrl && config.ai.baseUrl.startsWith('http:')) ? http : https;
 
 const PORT = config.server.port || 8090;
 const SECURITY = resolveSecurity(config);
@@ -1449,14 +1452,15 @@ function analyzeSnapshotOnce() {
           { type: 'text', text: prompt },
           { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${imageBase64}` } }
         ]
-      }],
-      max_tokens: 500
+      }]
+      // 不设 max_tokens：本地思考型模型（如 lfm）会先输出 reasoning_content，
+      // 固定上限常在思考阶段耗尽导致 content 为空；省略则由模型输出到自然停止。
     });
 
     const apiUrl = new URL(config.ai.baseUrl);
     const options = {
       hostname: apiUrl.hostname,
-      port: apiUrl.port || 443,
+      port: apiUrl.port || (aiHttpClient === http ? 80 : 443),
       path: apiUrl.pathname,
       method: 'POST',
       headers: {
@@ -1466,7 +1470,7 @@ function analyzeSnapshotOnce() {
       }
     };
 
-    const req = https.request(options, (res) => {
+    const req = aiHttpClient.request(options, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
@@ -1724,7 +1728,7 @@ reply 要符合 actions 实际效果——如果你输出了 turn_on(cool)+set_t
     const apiUrl = new URL(config.ai.baseUrl);
     const options = {
       hostname: apiUrl.hostname,
-      port: apiUrl.port || 443,
+      port: apiUrl.port || (aiHttpClient === http ? 80 : 443),
       path: apiUrl.pathname,
       method: 'POST',
       headers: {
@@ -1734,7 +1738,7 @@ reply 要符合 actions 实际效果——如果你输出了 turn_on(cool)+set_t
       }
     };
 
-    const req = https.request(options, (res) => {
+    const req = aiHttpClient.request(options, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
@@ -2221,7 +2225,7 @@ function naturalizeReply(records, userQuery) {
     const apiUrl = new URL(config.ai.baseUrl);
     const options = {
       hostname: apiUrl.hostname,
-      port: apiUrl.port || 443,
+      port: apiUrl.port || (aiHttpClient === http ? 80 : 443),
       path: apiUrl.pathname,
       method: 'POST',
       headers: {
@@ -2235,7 +2239,7 @@ function naturalizeReply(records, userQuery) {
     let settled = false;
     const finish = (out) => { if (!settled) { settled = true; resolve(out); } };
 
-    const req = https.request(options, (res) => {
+    const req = aiHttpClient.request(options, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
@@ -2521,13 +2525,13 @@ function answerVisualQuestion(command) {
         { type: 'text', text: prompt },
         { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${imageBase64}` } }
       ] }],
-      max_tokens: 100,
       temperature: 0.1
+      // 不设 max_tokens：同 analyzeSnapshotOnce，避免思考型模型 content 被截断为空。
     });
     const apiUrl = new URL(config.ai.baseUrl);
-    const req = https.request({
+    const req = aiHttpClient.request({
       hostname: apiUrl.hostname,
-      port: apiUrl.port || 443,
+      port: apiUrl.port || (aiHttpClient === http ? 80 : 443),
       path: apiUrl.pathname,
       method: 'POST',
       headers: {
@@ -2590,7 +2594,7 @@ function chitchatLLM(command, conversationMessages = []) {
     const apiUrl = new URL(config.ai.baseUrl);
     const options = {
       hostname: apiUrl.hostname,
-      port: apiUrl.port || 443,
+      port: apiUrl.port || (aiHttpClient === http ? 80 : 443),
       path: apiUrl.pathname,
       method: 'POST',
       headers: {
@@ -2604,7 +2608,7 @@ function chitchatLLM(command, conversationMessages = []) {
     let settled = false;
     const finish = (out) => { if (!settled) { settled = true; resolve(out); } };
 
-    const req = https.request(options, (res) => {
+    const req = aiHttpClient.request(options, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
@@ -3937,6 +3941,130 @@ const server = http.createServer(async (req, res) => {
         }
       });
       return;
+    }
+
+    if (pathname === '/api/spatial/rooms' && req.method === 'GET') {
+      const homeSnapshot = HomeState.snapshot();
+      const spaces = Object.values(homeSnapshot.spaces || {});
+      const rooms = SpatialRegistry.rooms.map(room => {
+        const space = spaces.find(item => item.id === room.id || item.name === room.name);
+        const entityIds = Object.entries(SpatialRegistry.bindings).filter(([, spaceId]) => spaceId === room.id).map(([entityId]) => entityId);
+        const online = entityIds.filter(entityId => {
+          const device = homeSnapshot.devices?.[entityId];
+          return device && device.state?.value !== undefined && device.state.value !== 'unavailable' && device.state.value !== 'unknown';
+        }).length;
+        return {
+          ...room,
+          entityIds,
+          deviceCount: entityIds.length,
+          onlineCount: online,
+          occupancy: space?.occupancy?.value || 'unknown',
+          occupancyLabel: space?.occupancy?.decision?.label || space?.occupancy?.label || null
+        };
+      });
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      return res.end(JSON.stringify({ rooms, bindings: SpatialRegistry.bindings, unassignedCount: SpatialRegistry.unassigned.size }));
+    }
+
+    if (pathname === '/api/spatial/registry/unassigned' && req.method === 'GET') {
+      try {
+        const states = await haRequest('GET', '/api/states');
+        const list = (Array.isArray(states) ? states : [])
+          .filter(entity => entity?.entity_id && !SpatialRegistry.bindings[entity.entity_id])
+          .map(entity => ({
+            entityId: entity.entity_id,
+            name: entity.attributes?.friendly_name || entity.entity_id,
+            domain: String(entity.entity_id).split('.')[0],
+            state: entity.state,
+            suggestedRoom: (SpatialRegistry.rooms.find(room => `${entity.attributes?.friendly_name || ''} ${entity.entity_id}`.includes(room.name)) || {}).id || null
+          }));
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        return res.end(JSON.stringify({ devices: list, total: list.length }));
+      } catch (error) {
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: `获取 HA 状态失败：${error.message}` }));
+      }
+    }
+
+    if (pathname === '/api/spatial/rooms' && req.method === 'POST') {
+      let body = '';
+      req.on('data', chunk => { body += chunk; if (body.length > 64 * 1024) req.destroy(); });
+      req.on('end', () => {
+        try {
+          const input = JSON.parse(body || '{}');
+          const name = String(input.name || '').trim();
+          if (!name) throw new Error('请填写空间名称');
+          if (SpatialRegistry.rooms.some(room => room.name === name)) throw new Error('空间名称已存在');
+          let roomId;
+          do {
+            roomId = `room_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+          } while (SpatialRegistry.rooms.some(room => room.id === roomId));
+          const room = { id: roomId, name, icon: String(input.icon || '◫').slice(0, 8) };
+          SpatialRegistry.rooms.push(room);
+          config.rooms = SpatialRegistry.rooms;
+          config.spaceRegistry = config.spaceRegistry || { bindings: {} };
+          config.spaceRegistry.bindings = { ...SpatialRegistry.bindings };
+          writeJsonAtomic(CONFIG_PATH, config);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, room, registry: SpatialRegistry.snapshot() }));
+        } catch (error) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: error.message }));
+        }
+      });
+      return;
+    }
+
+    if (pathname.startsWith('/api/spatial/rooms/') && req.method === 'PUT') {
+      const roomId = decodeURIComponent(pathname.slice('/api/spatial/rooms/'.length));
+      let body = '';
+      req.on('data', chunk => { body += chunk; if (body.length > 64 * 1024) req.destroy(); });
+      req.on('end', () => {
+        try {
+          const room = SpatialRegistry.rooms.find(item => item.id === roomId || item.name === roomId);
+          if (!room) throw new Error('目标空间不存在');
+          const input = JSON.parse(body || '{}');
+          const name = input.name === undefined ? room.name : String(input.name).trim();
+          if (!name) throw new Error('请填写空间名称');
+          if (SpatialRegistry.rooms.some(item => item !== room && item.name === name)) throw new Error('空间名称已存在');
+          room.name = name;
+          if (input.icon !== undefined) room.icon = String(input.icon).slice(0, 8) || room.icon;
+          config.rooms = SpatialRegistry.rooms;
+          writeJsonAtomic(CONFIG_PATH, config);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, room, registry: SpatialRegistry.snapshot() }));
+        } catch (error) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: error.message }));
+        }
+      });
+      return;
+    }
+
+    if (pathname.startsWith('/api/spatial/rooms/') && req.method === 'DELETE') {
+      const roomId = decodeURIComponent(pathname.slice('/api/spatial/rooms/'.length));
+      const roomIndex = SpatialRegistry.rooms.findIndex(item => item.id === roomId || item.name === roomId);
+      if (roomIndex === -1) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: '目标空间不存在' }));
+      }
+      const [removed] = SpatialRegistry.rooms.splice(roomIndex, 1);
+      let unboundCount = 0;
+      for (const entityId of Object.keys(SpatialRegistry.bindings)) {
+        if (SpatialRegistry.bindings[entityId] === removed.id) {
+          delete SpatialRegistry.bindings[entityId];
+          unboundCount += 1;
+        }
+      }
+      delete SpatialRegistry.environmentSources[removed.id];
+      config.rooms = SpatialRegistry.rooms;
+      config.spaceRegistry = config.spaceRegistry || { bindings: {} };
+      config.spaceRegistry.bindings = { ...SpatialRegistry.bindings };
+      config.spaceRegistry.environmentSources = JSON.parse(JSON.stringify(SpatialRegistry.environmentSources));
+      writeJsonAtomic(CONFIG_PATH, config);
+      HomeState.refreshEnvironmentSelections();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: true, removed: removed.id, unboundCount, registry: SpatialRegistry.snapshot() }));
     }
 
     if (pathname === '/api/home/events' && req.method === 'GET') {
