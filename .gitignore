@@ -3,6 +3,8 @@ config_*.json
 config-*.json
 config*.bak
 .env
+.dsh
+.acl-recovery
 memory.json
 activity-history.json
 activity-history.json.next
